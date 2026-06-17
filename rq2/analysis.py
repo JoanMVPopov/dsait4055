@@ -1,19 +1,3 @@
-"""
-RQ2: Are LLM-related Stack Overflow questions less answerable than mature
-programming questions?
-
-Implements Parts I-III of the methodology:
-  Part I   - Descriptive comparison (risk difference, Wilson CIs, chi-square +
-             Cramer's V, Mann-Whitney U + CLES/rank-biserial, Holm-Bonferroni)
-  Part II  - Adjusted comparison (logistic regression, HC1 SEs, month FE,
-             missing-reputation indicator method + 3-way robustness,
-             post-treatment sensitivity model, adjusted probability gap w/ delta-method CI)
-  Part III - Evolution over time (IsLLM x centered-time interaction model)
-  (+ community reception, robustness subsets)
-
-Part IV (Kaplan-Meier / Cox survival analysis) is intentionally excluded.
-"""
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -32,47 +16,31 @@ from scipy import stats
 from scipy.stats import chi2_contingency, mannwhitneyu
 from scipy.stats.contingency import association
 from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.proportion import proportion_confint
 
-# ── paths ────────────────────────────────────────────────────────────────────
 LLM_PATH = Path("outputs/validation/llm-data-cleaned.csv")
 MAT_PATH = Path("outputs/validation/mature-data-cleaned.csv")   # adjust if needed
 OUT_DIR  = Path("outputs/rq2")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── plot style ───────────────────────────────────────────────────────────────
 PALETTE = {"LLM": "#E05A5A", "Mature": "#4A90D9"}
 plt.rcParams.update({
     "figure.dpi": 150, "font.size": 11,
     "axes.spines.top": False, "axes.spines.right": False,
 })
 
-# Set explicitly if known, e.g. pd.Timestamp("2026-01-15", tz="UTC").
-# Left None -> inferred per-dataset as (max activity in that dataset) + 1 day,
-# matching the "per-dataset snapshot" design (LLM/mature pulled a couple of
-# days apart; each group's window is measured against its own extraction date).
 LLM_EXTRACTION_DATE = None
 MAT_EXTRACTION_DATE = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 0. LOAD, DEDUPLICATE, ENFORCE MUTUAL EXCLUSIVITY
-# ══════════════════════════════════════════════════════════════════════════════
 
 def load_data():
-    """
-    Load both exports, de-duplicate each by QuestionId, then remove any
-    question that appears in BOTH sets from the mature side (LLM membership
-    is treated as definitive). This guarantees no question is double-counted
-    or carries contradictory group labels.
-    """
     llm = pd.read_csv(LLM_PATH, low_memory=False)
     mat = pd.read_csv(MAT_PATH, low_memory=False)
 
-    # de-duplicate each dataset independently, first
     llm = llm.drop_duplicates(subset="QuestionId")
     mat = mat.drop_duplicates(subset="QuestionId")
 
-    # parse dates
     date_cols = ["CreationDate", "ClosedDate", "LastActivityDate",
                  "AcceptedAnswerCreationDate"]
     for df in (llm, mat):
@@ -80,7 +48,6 @@ def load_data():
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
-    # enforce mutual exclusivity: a question tagged/matched both ways is LLM
     overlap_ids = set(llm["QuestionId"]) & set(mat["QuestionId"])
     n_overlap = len(overlap_ids)
     if n_overlap:
@@ -89,22 +56,9 @@ def load_data():
     llm["group"] = "LLM"
     mat["group"] = "Mature"
 
-    print(f"LLM rows after dedup:               {len(llm):,}")
-    print(f"Mature rows after dedup (pre-overlap removal): "
-          f"{len(mat) + n_overlap:,}")
-    print(f"Questions in both sets (removed from mature):  {n_overlap:,}")
-    print(f"Mature rows after overlap removal:  {len(mat):,}")
     return llm, mat
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. WINDOWED OUTCOMES (THE CENSORING FIX)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def infer_extraction_date(df):
-    """Latest activity in the dataset + 1 day - a safe lower bound for the
-    true extraction date, used per-dataset since LLM/mature were pulled on
-    different days."""
     candidates = [df["CreationDate"].max()]
     if "LastActivityDate" in df.columns:
         candidates.append(df["LastActivityDate"].max())
@@ -113,14 +67,6 @@ def infer_extraction_date(df):
 
 def build_windowed_outcomes(df, extraction_date, answer_window_days=30,
                             accept_window_days=90, suffix=""):
-    """
-    AnsweredWithin{W}Days / AcceptedWithin{W}Days, with eligibility.
-    A question only counts toward an outcome if it has been observed for the
-    FULL window; otherwise the outcome is NaN (missing), not a failure.
-    Whole-day counting (age_days computed as a float, window as integer days)
-    means windows tolerate up to ~1 extra day at the boundary - identical for
-    both groups, so it cannot bias the comparison.
-    """
     age_days = (extraction_date - df["CreationDate"]).dt.total_seconds() / 86_400
 
     answered_col  = f"AnsweredWithin{answer_window_days}Days{suffix}"
@@ -128,7 +74,6 @@ def build_windowed_outcomes(df, extraction_date, answer_window_days=30,
     accepted_col  = f"AcceptedWithin{accept_window_days}Days{suffix}"
     eligible_c_col = f"EligibleAccepted{accept_window_days}{suffix}"
 
-    # ── Answered ─────────────────────────────────────────────────────────
     eligible_a = age_days >= answer_window_days
     if "TimeToFirstAnswerHours" in df.columns:
         answered = (df["TimeToFirstAnswerHours"].notna() &
@@ -141,7 +86,6 @@ def build_windowed_outcomes(df, extraction_date, answer_window_days=30,
     df[answered_col]   = np.where(eligible_a, answered.astype(float), np.nan)
     df[eligible_a_col] = eligible_a
 
-    # ── Accepted ─────────────────────────────────────────────────────────
     eligible_c = age_days >= accept_window_days
     if "AcceptedAnswerCreationDate" in df.columns:
         tt_accept = (df["AcceptedAnswerCreationDate"] - df["CreationDate"]
@@ -161,51 +105,26 @@ def build_windowed_outcomes(df, extraction_date, answer_window_days=30,
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART I — DESCRIPTIVE COMPARISON
-# ══════════════════════════════════════════════════════════════════════════════
-
-def wilson_ci(k, n, z=1.96):
-    """Wilson score 95% CI - stays within [0,1] even for small n / extreme p,
-    unlike the textbook normal-approximation interval."""
-    if n == 0:
+def wilson_ci(k, n):
+    if np.isscalar(n) and n == 0:
         return np.nan, np.nan
-    p = k / n
-    denom = 1 + z**2 / n
-    centre = (p + z**2 / (2 * n)) / denom
-    margin = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
-    return centre - margin, centre + margin
+    return proportion_confint(k, n, alpha=0.05, method="wilson")
 
 
-def cramers_v_2x2(chi2, n):
-    """Cramer's V for a 2x2 table (= phi coefficient). Rescales chi-square to
-    a 0-1, sample-size-independent measure of association strength.
-    Note: attenuated when group sizes are very unequal (e.g. 20k vs 1.5M) -
-    report alongside, not instead of, the risk difference."""
-    return np.sqrt(chi2 / n)
+def cramers_v_2x2(ct):
+    return association(ct, method="cramer", correction=False)
 
 
 def cles_and_rbc(u_stat, n1, n2):
-    """
-    CLES (Common-Language Effect Size) = P(random group-1 value > random
-    group-2 value) = U / (n1*n2). Rank-biserial correlation = 2*CLES - 1.
-    Always pass the LLM group as group 1, so CLES>0.5 / RBC>0 means LLM
-    values are typically larger (e.g. LLM waits longer for an answer).
-    Implemented via scipy's U statistic + the Kerby (2014) identities,
-    since pingouin's CLES implementation is memory-prohibitive at this scale.
-    """
     cles = u_stat / (n1 * n2)
     rbc = 2 * cles - 1
     return cles, rbc
 
 
 def run_descriptives(llm, mat, answer_col, accept_col):
-    """Risk differences, Wilson CIs, chi-square + Cramer's V (binary);
-    medians, Mann-Whitney U + CLES/RBC (continuous); Holm-Bonferroni across
-    the whole family."""
     rate_rows = []
-    raw_tests = []   # (label, statistic, p, effect_size, es_name)
-
+    raw_tests = []   
+    
     def compare_binary(outcome, label):
         l = llm[outcome].dropna()
         m = mat[outcome].dropna()
@@ -215,9 +134,9 @@ def run_descriptives(llm, mat, answer_col, accept_col):
         mrate, (mcilo, mcihi) = mk / mn, wilson_ci(mk, mn)
         rd = lrate - mrate
 
-        ct = np.array([[lk, ln - lk], [mk, mn - mk]])
+        ct = np.array([[lk, ln - lk], [mk, mn - mk]]).astype(int)
         chi2, p, dof, _ = chi2_contingency(ct, correction=False)
-        v = cramers_v_2x2(chi2, ln + mn)
+        v = cramers_v_2x2(ct)
 
         rate_rows.append({"Outcome": label, "Group": "LLM",
                           "n": ln, "Rate": lrate, "CI_lo": lcilo, "CI_hi": lcihi})
@@ -261,23 +180,7 @@ def run_descriptives(llm, mat, answer_col, accept_col):
     return pd.DataFrame(rate_rows), tests_df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART II — ADJUSTED COMPARISON (LOGISTIC REGRESSION)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def build_model_data(llm, mat, outcome, eligible_col, reputation_method="per_group_median"):
-    """
-    Combine groups, keep only eligible rows with a non-missing outcome, and
-    build the posting-time control variables.
-
-    reputation_method controls how missing OwnerReputation is handled:
-      "per_group_median" -> fill with each group's own median  [MAIN MODEL]
-      "pooled_median"    -> fill with the pooled median over both groups
-      "complete_case"    -> drop rows with missing reputation
-    All three add a ReputationMissing flag (except complete_case, where it's
-    irrelevant) so the model can give those rows their own baseline rather
-    than letting a made-up median value distort the fit.
-    """
     combined = pd.concat([llm, mat], ignore_index=True)
     combined = combined[combined[eligible_col] == True].copy()
     combined["IsLLM"] = (combined["group"] == "LLM").astype(int)
@@ -301,7 +204,7 @@ def build_model_data(llm, mat, outcome, eligible_col, reputation_method="per_gro
             pooled_median = combined[rep_col].median()
             filled = combined[rep_col].fillna(pooled_median)
             combined["LogReputation"] = np.log1p(filled)
-        else:  # per_group_median (main)
+        else:
             group_medians = combined.groupby("group")[rep_col].median()
             filled = combined[rep_col].fillna(combined["group"].map(group_medians))
             combined["LogReputation"] = np.log1p(filled)
@@ -327,32 +230,36 @@ MAIN_FORMULA_RHS = (
 
 
 def fit_logit(formula, data, cov_type="HC1"):
-    """Fit with HC1 robust SEs (the document's specified default); fall back
-    to dropping month dummies if the design matrix is singular (can happen
-    on small/sparse data where some months have only one group)."""
     try:
         return smf.logit(formula, data=data).fit(
             cov_type=cov_type, disp=False, maxiter=200)
     except np.linalg.LinAlgError:
-        print("  WARNING: singular design matrix with month FE; "
-              "refitting without month dummies.")
-        formula_no_month = formula.replace(" + C(Month)", "")
+        pass
+
+    print("  WARNING: singular design matrix; refitting without month dummies.")
+    formula_no_month = formula.replace(" + C(Month)", "")
+    try:
         return smf.logit(formula_no_month, data=data).fit(
             cov_type=cov_type, disp=False, maxiter=200)
+    except np.linalg.LinAlgError:
+        pass
+
+    rhs_terms = formula_no_month.split("~")[1].strip().split(" + ")
+    keep_terms = []
+    for term in rhs_terms:
+        col = term.strip()
+        if col in data.columns and data[col].nunique(dropna=True) <= 1:
+            print(f"  WARNING: dropping constant column '{col}' from model "
+                  f"(zero variance in this subset).")
+            continue
+        keep_terms.append(term)
+    formula_reduced = formula_no_month.split("~")[0] + "~ " + " + ".join(keep_terms)
+    print(f"  Refitting with reduced formula: {formula_reduced}")
+    return smf.logit(formula_reduced, data=data).fit(
+        cov_type=cov_type, disp=False, maxiter=200)
 
 
 def adjusted_probability_gap(model, data, n_boot=300, seed=0):
-    """
-    G-computation / average adjusted predictions:
-      p_mature = mean predicted P(outcome) if everyone were IsLLM=0
-      p_LLM    = mean predicted P(outcome) if everyone were IsLLM=1
-      gap      = p_LLM - p_mature
-    CI via a parametric bootstrap over the model's coefficient covariance
-    (a practical stand-in for the delta-method CI that the `marginaleffects`
-    R package would supply; same logic - propagate coefficient uncertainty
-    into the averaged prediction - implemented manually since marginaleffects
-    has no Python equivalent).
-    """
     p_llm_point = model.predict(data.assign(IsLLM=1)).mean()
     p_mat_point = model.predict(data.assign(IsLLM=0)).mean()
     gap_point = p_llm_point - p_mat_point
@@ -403,8 +310,6 @@ def run_main_logistic(llm, mat, outcome, eligible_col):
 
 
 def run_reputation_robustness(llm, mat, outcome, eligible_col):
-    """Re-fit the main model three ways to show the missing-reputation
-    handling choice doesn't drive the IsLLM result."""
     rows = []
     for method in ["per_group_median", "pooled_median", "complete_case"]:
         data = build_model_data(llm, mat, outcome, eligible_col, method)
@@ -422,14 +327,6 @@ def run_reputation_robustness(llm, mat, outcome, eligible_col):
 
 
 def run_sensitivity_model(llm, mat, outcome, eligible_col):
-    """
-    Adds Score/ViewCount/CommentCount - post-treatment variables, measured
-    after posting and partly caused by the outcome itself (an answered
-    question accrues more views/comments). Including them is post-treatment
-    bias: it can remove part of the very effect being measured. Reported
-    only as a labelled sensitivity check, alongside the main model's gap,
-    so the instability this causes is visible side-by-side.
-    """
     data = build_model_data(llm, mat, outcome, eligible_col, "per_group_median")
     post_vars = [v for v in ["Score", "ViewCount", "CommentCount"] if v in data.columns]
     if not post_vars:
@@ -449,26 +346,19 @@ def run_sensitivity_model(llm, mat, outcome, eligible_col):
     return or_df, adj
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PART III — EVOLUTION OVER TIME
-# ══════════════════════════════════════════════════════════════════════════════
-
 def compute_monthly_rates(df, outcome, eligible_col):
     sub = df[df[eligible_col]].copy()
     sub["YearMonth"] = sub["CreationDate"].dt.to_period("M")
     grp = sub.groupby("YearMonth")[outcome].agg(["sum", "count"]).reset_index()
     grp.columns = ["YearMonth", "n_event", "n_total"]
     grp["rate"]  = grp["n_event"] / grp["n_total"]
-    cis = grp.apply(lambda r: wilson_ci(r.n_event, r.n_total), axis=1)
-    grp["ci_lo"] = cis.apply(lambda t: t[0])
-    grp["ci_hi"] = cis.apply(lambda t: t[1])
+    ci_lo, ci_hi = proportion_confint(grp["n_event"], grp["n_total"],
+                                      alpha=0.05, method="wilson")
+    grp["ci_lo"], grp["ci_hi"] = ci_lo, ci_hi
     return grp
 
 
 def plot_monthly_rates(llm, mat, outcome, eligible_col, label, fname):
-    """Top panel: rates with CIs for both groups (any platform-wide month
-    effect hits both lines equally). Bottom panel: the gap series (LLM minus
-    Mature) - shared dips cancel out, so a moving gap is LLM-specific."""
     gl = compute_monthly_rates(llm, outcome, eligible_col)
     gm = compute_monthly_rates(mat, outcome, eligible_col)
 
@@ -505,16 +395,6 @@ def plot_monthly_rates(llm, mat, outcome, eligible_col, label, fname):
 
 
 def run_interaction_model(llm, mat, outcome, eligible_col):
-    """
-    logit(p) = b0 + b1*IsLLM + b2*time + b3*(IsLLM*time) + controls
-    time is CENTERED (0 = midpoint of the window), so b1 is interpretable as
-    "the LLM gap at the midpoint of the observation period" rather than an
-    extrapolation back to month zero.
-    b3 (the headline number): >0 = gap shrinking (catching up), <0 = widening.
-    b2 (time main effect) absorbs any platform-wide trend shared by both
-    groups; b3 isolates only the LLM-specific change - the direct answer to
-    "is this just a Stack-Overflow-wide effect?"
-    """
     combined = pd.concat([llm, mat], ignore_index=True)
     combined = combined[combined[eligible_col] == True].copy()
     combined["IsLLM"] = (combined["group"] == "LLM").astype(int)
@@ -553,10 +433,6 @@ def run_interaction_model(llm, mat, outcome, eligible_col):
         return {}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COMMUNITY RECEPTION
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run_community_reception(llm, mat):
     combined = pd.concat([llm, mat], ignore_index=True)
     combined["IsLLM"] = (combined["group"] == "LLM").astype(int)
@@ -567,7 +443,7 @@ def run_community_reception(llm, mat):
         lc = combined.loc[combined["IsLLM"] == 1, "IsClosed"]
         mc = combined.loc[combined["IsLLM"] == 0, "IsClosed"]
         ct = np.array([[lc.sum(), len(lc) - lc.sum()],
-                       [mc.sum(), len(mc) - mc.sum()]])
+                       [mc.sum(), len(mc) - mc.sum()]]).astype(int)
         rd = lc.mean() - mc.mean()
         if ct.min() == 0:
             print("  WARNING: zero cell in closure-rate table; using Fisher exact.")
@@ -575,7 +451,7 @@ def run_community_reception(llm, mat):
             chi2, v = np.nan, np.nan
         else:
             chi2, p, dof, _ = chi2_contingency(ct, correction=False)
-            v = cramers_v_2x2(chi2, len(combined))
+            v = cramers_v_2x2(ct)
         rows.append({"Metric": "Closure rate", "LLM": lc.mean(), "Mature": mc.mean(),
                      "RiskDiff": rd, "EffectSize": v, "ES_name": "Cramér's V"})
         raw_tests.append(("Closure rate", chi2, p, v))
@@ -625,15 +501,7 @@ def plot_community_reception(llm, mat):
     print(f"  Saved: {OUT_DIR / 'fig_community_reception.png'}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ROBUSTNESS CHECKS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def run_robustness(llm, mat):
-    """
-    (a) Alternative windows (7-day answered / 30-day accepted) instead of 30/90.
-    (b) Detection-type subsets (tag-only vs keyword-only), if available.
-    """
     notes = []
     alt_rates = {}
 
@@ -669,10 +537,6 @@ def run_robustness(llm, mat):
     return {"alt_windows": alt_rates, "detection_subsets": detection_subsets}, notes
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIGURES
-# ══════════════════════════════════════════════════════════════════════════════
-
 def plot_adj_prob(adj_answer, adj_accept):
     fig, axes = plt.subplots(1, 2, figsize=(8, 4))
     for ax, adj, title in zip(axes, [adj_answer, adj_accept],
@@ -697,16 +561,11 @@ def plot_adj_prob(adj_answer, adj_accept):
     print(f"  Saved: {OUT_DIR / 'fig_adj_prob.png'}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main():
     print("=" * 64)
     print("RQ2 ANALYSIS  (Parts I-III; survival analysis excluded)")
     print("=" * 64)
 
-    # 0. Load + dedup + mutual exclusivity
     print("\n[0] Loading data…")
     llm, mat = load_data()
 
@@ -715,7 +574,6 @@ def main():
     print(f"  LLM extraction date (inferred):    {llm_extraction.date()}")
     print(f"  Mature extraction date (inferred): {mat_extraction.date()}")
 
-    # 1. Windowed outcomes (main: 30d / 90d)
     print("\n[1] Building windowed outcomes (30d answered / 90d accepted)…")
     llm = build_windowed_outcomes(llm, llm_extraction)
     mat = build_windowed_outcomes(mat, mat_extraction)
@@ -732,7 +590,6 @@ def main():
     print(f"  Mat  eligible(90d): {mat[ELIG_C].sum():,}  "
           f"accepted rate: {mat.loc[mat[ELIG_C], ACCEPT_COL].mean():.1%}")
 
-    # PART I — Descriptives
     print("\n[I] Descriptive comparison…")
     rates_df, tests_df = run_descriptives(llm, mat, ANSWER_COL, ACCEPT_COL)
     rates_df.to_csv(OUT_DIR / "table_descriptive_rates.csv", index=False)
@@ -741,7 +598,6 @@ def main():
     print()
     print(tests_df.to_string(index=False))
 
-    # PART II — Logistic regression (adjusted comparison)
     print("\n[II] Logistic regression (main model, HC1 SEs, month FE)…")
     or_answer, adj_answer = run_main_logistic(llm, mat, ANSWER_COL, ELIG_A)
     or_accept, adj_accept = run_main_logistic(llm, mat, ACCEPT_COL, ELIG_C)
@@ -764,7 +620,6 @@ def main():
 
     plot_adj_prob(adj_answer, adj_accept)
 
-    # Missing-reputation robustness (3-way comparison)
     print("\n[II.a] Missing-reputation handling robustness (3-way)…")
     rep_rob_answer = run_reputation_robustness(llm, mat, ANSWER_COL, ELIG_A)
     rep_rob_accept = run_reputation_robustness(llm, mat, ACCEPT_COL, ELIG_C)
@@ -773,7 +628,6 @@ def main():
     print("  Answered:"); print(rep_rob_answer.to_string(index=False))
     print("  Accepted:"); print(rep_rob_accept.to_string(index=False))
 
-    # Post-treatment sensitivity model
     print("\n[II.b] Sensitivity model (post-treatment vars included; NOT the main result)…")
     sen_or, sen_adj = run_sensitivity_model(llm, mat, ANSWER_COL, ELIG_A)
     if sen_or is not None:
@@ -788,7 +642,6 @@ def main():
     with open(OUT_DIR / "sensitivity_vs_main_gap.json", "w") as f:
         json.dump({"main": adj_answer, "sensitivity": sen_adj}, f, indent=2, default=str)
 
-    # PART III — Evolution over time
     print("\n[III] Monthly trends…")
     gap_answer = plot_monthly_rates(llm, mat, ANSWER_COL, ELIG_A,
                                     "Answered rate (30-day window)", "fig_monthly_answered.png")
@@ -811,7 +664,6 @@ def main():
     with open(OUT_DIR / "interaction_model_results.json", "w") as f:
         json.dump({"answered": ia_answer, "accepted": ia_accept}, f, indent=2, default=str)
 
-    # Community reception
     print("\n[Community reception]…")
     recep_df, recep_tests = run_community_reception(llm, mat)
     if not recep_df.empty:
@@ -821,7 +673,6 @@ def main():
         print(recep_tests.to_string(index=False))
     plot_community_reception(llm, mat)
 
-    # Robustness checks
     print("\n[Robustness]…")
     rob, notes = run_robustness(llm, mat)
     for n in notes:
