@@ -17,6 +17,7 @@ labeled sample, against a written definition agreed on before labeling.
 |------|------|
 | `llm_detection.py` | Re-derives detection offline, per rule. Run once. |
 | `llm_validation.py` | Sampling, annotation handling, precision analysis, filtering. Run in three stages. |
+| `llm_posthoc_manual_review.py` | Adjudicates the `MANUAL_REVIEW` rules left by `analyze` (KEEP/DROP per rule). Run after Step 3 if any questions need review. |
 
 ## Expected folder layout
 
@@ -30,7 +31,8 @@ project/
 └── validation/
     ├── README.md
     ├── llm_detection.py
-    └── llm_validation.py
+    ├── llm_validation.py
+    └── llm_posthoc_manual_review.py
 ```
 
 Paths are resolved relative to the script location (same convention as the
@@ -142,7 +144,55 @@ Outputs:
 - `rule-decision-table.csv` - precision, CI, counts, decision per rule
   (paper appendix material).
 - `llm-data-cleaned.csv` - the final dataset. Point the RQ1/RQ2 scripts
-  at this file instead of `llm-combined-data.csv`.
+  at this file instead of `llm-combined-data.csv`. (If any rules came out
+  `MANUAL_REVIEW`, run Step 4 before treating this as final.)
+
+### Step 4 - Post-hoc manual review (only if needed)
+
+`analyze` cannot auto-decide a rule with fewer than 5 labeled examples, so
+it marks those `MANUAL_REVIEW` and exports every question gated *only* by
+such rules to `questions-needing-review.csv`. Those questions are **not**
+in the cleaned set yet. This step records an explicit decision for each
+such rule and folds the result back in - **without** modifying the frozen
+pipeline above (it imports and reuses `llm_validation.filter_dataset`, so
+the filtering logic lives in exactly one place).
+
+The unit of decision is the **rule**, not the individual question: you are
+vouching that a low-evidence detection rule is (un)trustworthy, the same
+rule-based logic the precision threshold uses - not hand-picking questions.
+
+```
+python llm_posthoc_manual_review.py        # 1st run: writes a template
+# fill the Decision column (KEEP/DROP) in manual-rule-decisions.csv
+python llm_posthoc_manual_review.py        # 2nd run: applies the decisions
+```
+
+The **first run** writes `manual-rule-decisions.csv`, one row per rule that
+gates a review question, with context to make the call:
+
+| Rule | LabeledQuestions | Precision | QuestionsGated | ExampleQuestionId | ExampleTitle | Decision |
+|------|-----------------|-----------|----------------|-------------------|--------------|----------|
+| `tag:gemini-code-assist` | 1 | 0.0 | 1 | 79724577 | How do I save the file using Cmd+S... | *(fill: KEEP/DROP)* |
+| `tag:h2ogpt` | 3 | 1.0 | 1 | 77985749 | h2ogpt: unable to add document...    | *(fill: KEEP/DROP)* |
+
+Fill `Decision` with `KEEP` or `DROP` per rule. The **second run** applies
+them and rewrites, in `outputs/validation/`:
+
+- `rule-decision-table.csv` - the adjudicated rules flip from
+  `MANUAL_REVIEW` to `KEEP`/`DROP`, with a `ManualOverride` flag set so the
+  manual calls stay auditable in the appendix table.
+- `llm-data-cleaned.csv` - now includes the questions gated by KEEP'd
+  rules (same schema as the `analyze` output).
+- `questions-needing-review.csv` - rewritten with any still-undecided rows
+  (empty once everything is resolved).
+
+Properties: the script is **idempotent** (re-running after a successful
+apply finds nothing to do) and **re-analyze-safe** (if you re-run `analyze`,
+which resets the table, just run this script again - the saved
+`manual-rule-decisions.csv` is re-applied automatically). It **fails loud**
+if a gating rule has no valid `KEEP`/`DROP`, rather than silently dropping
+questions, matching the "nothing decided implicitly" property of the rest
+of the pipeline.
 
 ## Configuration
 
@@ -166,7 +216,8 @@ All knobs sit at the top of `llm_validation.py`:
 - Raw agreement and Cohen's κ; disagreement resolution by a third
   annotator.
 - Per-rule precision with Wilson 95% CIs and the threshold decision
-  (the rule decision table as an appendix table).
+  (the rule decision table as an appendix table), including any rules
+  resolved by post-hoc manual review (the `ManualOverride` column).
 - Size of the dataset before and after filtering, and the precision among
   labeled questions in the cleaned set.
 
